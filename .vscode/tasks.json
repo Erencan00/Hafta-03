@@ -1,0 +1,22 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Flash (ST-Link)",
+            "type": "process",
+            "command": "${env:LOCALAPPDATA}/stm32cube/bundles/programmer/2.23.0/bin/STM32_Programmer_CLI.exe",
+            "args": ["-c", "port=SWD", "mode=UR", "-w", "${workspaceFolder}/build/Debug/Hafta-01.elf", "-v", "-rst"],
+            "problemMatcher": []
+        },
+        {
+            "label": "SystemView: ST-Link koprusu",
+            "detail": "SystemView IP Recorder icin 127.0.0.1:19111 (debug oturumu kapali olmali)",
+            "type": "process",
+            "command": "${workspaceFolder}/tools/.venv/Scripts/python.exe",
+            "args": ["${workspaceFolder}/tools/sysview_stlink.py"],
+            "options": { "env": { "PYTHONIOENCODING": "utf-8" } },
+            "isBackground": true,
+            "problemMatcher": []
+        }
+    ]
+}
