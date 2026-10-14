@@ -6,10 +6,23 @@
             "type": "process",
             "command": "${env:LOCALAPPDATA}/stm32cube/bundles/programmer/2.23.0/bin/STM32_Programmer_CLI.exe",
             "args": ["-c", "port=SWD", "mode=UR", "-w", "${workspaceFolder}/build/Debug/Hafta-01.elf", "-v", "-rst"],
+            "dependsOn": "SystemView: Durdur",
             "problemMatcher": []
         },
         {
-            "label": "SystemView: ST-Link koprusu",
+            "label": "SystemView: Durdur",
+            "detail": "SystemView koprusunu kapatir, ST-Link'i debug/flash icin serbest birakir",
+            "type": "process",
+            "command": "powershell.exe",
+            "args": [
+                "-NoProfile", "-Command",
+                "$p = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'sysview_stlink' }; if ($p) { $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep -Milliseconds 500; Write-Host 'SystemView koprusu kapatildi, ST-Link serbest.' } else { Write-Host 'Kopru zaten kapali.' }"
+            ],
+            "presentation": { "reveal": "silent", "close": true },
+            "problemMatcher": []
+        },
+        {
+            "label": "SystemView: Baslat",
             "detail": "SystemView IP Recorder icin 127.0.0.1:19111 (debug oturumu kapali olmali)",
             "type": "process",
             "command": "${workspaceFolder}/tools/.venv/Scripts/python.exe",

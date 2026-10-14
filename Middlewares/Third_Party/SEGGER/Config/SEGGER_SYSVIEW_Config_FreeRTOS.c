@@ -52,6 +52,7 @@ Revision: $Rev: 7745 $
 #include "stm32l4xx.h"
 
 extern const SEGGER_SYSVIEW_OS_API SYSVIEW_X_OS_TraceAPI;
+extern void app_sysview_send_desc(void);
 
 /*********************************************************************
 *
@@ -86,6 +87,7 @@ extern const SEGGER_SYSVIEW_OS_API SYSVIEW_X_OS_TraceAPI;
 static void _cbSendSystemDesc(void) {
   SEGGER_SYSVIEW_SendSysDesc("N="SYSVIEW_APP_NAME",D="SYSVIEW_DEVICE_NAME",O=FreeRTOS");
   SEGGER_SYSVIEW_SendSysDesc("I#15=SysTick,I#45=TIM3_HALTick,I#54=USART2,I#56=EXTI15_10_Buton");
+  app_sysview_send_desc();   /* main.c: txQ Data Plot kanallari + "txQ DOLU" marker */
 }
 
 /*********************************************************************

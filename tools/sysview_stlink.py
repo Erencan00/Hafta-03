@@ -313,6 +313,15 @@ def main() -> int:
                 log.warning("%s; 2 sn sonra tekrar", e)
                 time.sleep(2)
                 continue
+            except Exception as e:      # ST-Link USB hatasi (kart cekildi, flash'landi vb.)
+                log.error("ST-Link hatasi: %s; yeniden baglaniliyor", e)
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = None
+                time.sleep(2)
+                continue
 
             # --- SystemView ---
             log.info("SystemView bekleniyor: Target > Start Recording (IP %s:%d)", args.host, args.port)

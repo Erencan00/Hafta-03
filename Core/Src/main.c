@@ -79,6 +79,7 @@ typedef struct
   uint8_t  scn;
   uint32_t id;
   uint32_t t_event_us;     /* TEL: release ani, BTN: t0 */
+  uint32_t t_gen_us;       /* mesajin uretildigi an (txQ'ya gonderimden hemen once) */
   union
   {
     struct { uint32_t sample; int16_t temp_dC; uint16_t vbat_mV; uint32_t exec_us; } tel;
@@ -120,6 +121,24 @@ typedef enum
   TX_TMO
 } TxResult;
 
+/* txQ istatistigi, kaynak basina (g_rt.txq[TEL] / [BTN] / [CTL]).
+ * Her alanin tek yazari var: gonderim alanlari ureticide (TEL: TelemetriTask,
+ * BTN: ButtonTask, CTL: USART2 RX ISR), alim/servis alanlari UartTxTask'ta.
+ * Degismez: attempted == accepted + failed
+ *           accepted  == consumed + flushed + (kuyrukta + o an serviste olan) */
+typedef struct
+{
+  uint32_t attempted;                     /* gonderme girisimi                              */
+  uint32_t accepted;                      /* kuyruga alindi (pdPASS)                        */
+  uint32_t failed;                        /* kuyruk dolu: alinmadi                          */
+  uint32_t consumed;                      /* UartTxTask servisini bitirdi (UART/komut)      */
+  uint32_t flushed;                       /* kuyruktayken butonla silindi (servis yok)      */
+  uint32_t send_call_us;                  /* son gonderme cagrisinin duvar saati suresi     */
+  uint32_t send_call_us_max;              /*   (bloklanma + kesilme dahil)                  */
+  uint32_t generation_to_receive_us;      /* son mesaj: uretim -> UartTxTask'in almasi      */
+  uint32_t generation_to_receive_us_max;
+} TxqSrcStats;
+
 /* Senaryo degisince sifirlanir. Debugger -> Live Expressions */
 typedef struct
 {
@@ -139,6 +158,11 @@ typedef struct
   uint32_t tel_max_jitter_us;
   uint32_t rx_err;
   uint32_t cmd_bad;
+  uint32_t txq_max_fill;       /* txQ'da gorulen en yuksek doluluk (en fazla TXQ_LEN) */
+  uint32_t txq_full;           /* TelemetriTask'in txQ'yu dolu buldugu yazma sayisi */
+  uint32_t txq_reset;          /* butonla yapilan txQ sifirlama sayisi             */
+  uint32_t txq_reset_msgs;     /* sifirlamalarda silinen toplam mesaj              */
+  TxqSrcStats txq[3];          /* [TEL], [BTN], [CTL]: bkz. TxqSrcStats            */
 } RtStats;
 /* USER CODE END PTD */
 
@@ -153,7 +177,10 @@ typedef struct
 #define BTN_STACK_WORDS     256u
 #define UARTTX_STACK_WORDS  512u  /* snprintf icin genis */
 
-#define TXQ_LEN             16u
+#define TXQ_LEN             20u
+#define TXQ_WRITES_PER_READ 3u    /* TelemetriTask 3 yazarken UartTxTask 1 TEL okur -> txQ dolar */
+#define TXQ_SEND_TIMEOUT_MS 50u   /* txQ doluysa xQueueSend en fazla bu kadar bekler, sonra veri ATILIR */
+#define TXQ_RECV_TIMEOUT_MS 50u   /* txQ bossa xQueueReceive en fazla bu kadar bekler */
 #define BUTTONQ_LEN         8u
 
 #define BTN_DEADLINE_US     20000u
@@ -161,14 +188,25 @@ typedef struct
 #define BTN_REC_SLOTS       16u
 
 #define SCN_COUNT           6u
-#define SCN_DEFAULT         0u
+#define SCN_DEFAULT         5u   /* S1: 10 Hz telemetri, acilista aktif */
 #define CTL_QUERY           0xFFu
 #define CTL_BAUD            0xFDu
 
 #define UART_TX_MARGIN_MS   20u     /* TMO = satirin hattaki suresi + bu pay */
 #define BAUD_CONFIRM_MS     3000u   /* yeni hizda bu surede "?" gelmezse eski hiza don */
-#define UARTTX_IDLE_MS      50u     /* kuyruk bossa bu aralikla biten kayitlari raporla */
 #define CMD_BUF_LEN         12u
+
+/* SystemView: Data Plot kanallari ve marker */
+#define SV_DATA_TXQ_FILL    0u      /* txQ'daki mesaj sayisi (0..TXQ_LEN)    */
+#define SV_DATA_TXQ_DROP    1u      /* dolu kuyruga yazilamayan TEL (toplam) */
+#define SV_DATA_TEL_G2R     2u      /* TEL: uretim -> UartTxTask alimi (us)  */
+#define SV_DATA_BTN_G2R     3u      /* BTN: uretim -> UartTxTask alimi (us)  */
+#define SV_DATA_TEL_SEND    4u      /* TEL: xQueueSend cagri suresi (us)     */
+#define SV_DATA_BTN_SEND    5u      /* BTN: xQueueSend cagri suresi (us)     */
+#define SV_MARK_TXQ_FULL    0u      /* "txQ DOLU" araligi: doldu -> butona basildi    */
+#define SV_MARK_TXQ_RESET   1u      /* butonla txQ sifirlama ani (tek nokta)          */
+#define SV_MARK_SEND_WAIT   2u      /* TelemetriTask dolu txQ'da xQueueSend icinde bekliyor */
+#define SV_MARK_RECV_WAIT   3u      /* UartTxTask bos txQ'da xQueueReceive icinde bekliyor  */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -238,6 +276,14 @@ static const uint32_t kBaud[] = { 9600u, 19200u, 57600u, 115200u, 230400u, 46080
 static uint32_t   baudPrev;                     /* onay bekleyen degisimden onceki hiz */
 static uint8_t    baudPending;                  /* 1: yeni hiz henuz onaylanmadi       */
 static TickType_t baudDeadline;
+
+/* txQ dolu iken gelen komut kaybolmasin: RX ISR buraya birakir, UartTxTask alir */
+static volatile uint8_t  ctlPending;
+static volatile uint8_t  ctlPendingCmd;
+static volatile uint32_t ctlPendingBaud;
+
+/* 1: TelemetriTask txQ'yu dolu buldu. Butona basilinca ButtonTask txQ'yu sifirlar ve 0 yapar. */
+static volatile uint8_t  txqFullLatched;
 
 volatile RtStats g_rt;
 /* USER CODE END PV */
@@ -332,6 +378,7 @@ static TxMsg make_telemetry(uint32_t t_release_us)
   m.u.tel.temp_dC = (int16_t)(240 + (int32_t)(sample % 21u));   /* 24.0 .. 26.0 C */
   m.u.tel.vbat_mV = (uint16_t)(3300u - (sample % 50u));
   m.u.tel.exec_us = exec;
+  m.t_gen_us      = timer_us();
   sample++;
   return m;
 }
@@ -386,6 +433,7 @@ static TxMsg make_button_reply(uint32_t id)
   m.scn        = r->scn;
   m.id         = id;
   m.t_event_us = r->t0;
+  m.t_gen_us   = timer_us();
   return m;
 }
 
@@ -624,6 +672,336 @@ static void handle_button_reply(const TxMsg *m)
       g_rt.btn_deadline_miss++;
     }
   }
+}
+
+/* ------------------------- txQ doluluk izleme (SystemView) ------------------------- */
+#if defined(USE_SYSVIEW) && (USE_SYSVIEW == 1)
+/* SEGGER_SYSVIEW_Config_FreeRTOS.c -> _cbSendSystemDesc icinden cagrilir:
+ * SystemView her "Start"ta kanal/marker tanimlarini yeniden alir. */
+void app_sysview_send_desc(void)
+{
+  static SEGGER_SYSVIEW_DATA_REGISTER fill =
+  {
+    .ID = SV_DATA_TXQ_FILL, .DataType = SEGGER_SYSVIEW_TYPE_FLOAT,
+    .RangeMin = 0, .RangeMax = (I32)TXQ_LEN, .ScalingFactor = 1.0f,
+    .sName = "txQ doluluk", .sUnit = "mesaj"
+  };
+  static SEGGER_SYSVIEW_DATA_REGISTER drop =
+  {
+    .ID = SV_DATA_TXQ_DROP, .DataType = SEGGER_SYSVIEW_TYPE_FLOAT,
+    .RangeMin = 0, .RangeMax = 1000, .ScalingFactor = 1.0f,
+    .sName = "txQ TEL kayip", .sUnit = "mesaj"
+  };
+  /* Gecikme: S1'de dolu txQ'da TEL ~20 x 300 ms bekler -> 6 s ust sinir */
+  static SEGGER_SYSVIEW_DATA_REGISTER telG2r =
+  {
+    .ID = SV_DATA_TEL_G2R, .DataType = SEGGER_SYSVIEW_TYPE_FLOAT,
+    .RangeMin = 0, .RangeMax = 6000000, .ScalingFactor = 1.0f,
+    .sName = "TEL uretim->alim", .sUnit = "us"
+  };
+  static SEGGER_SYSVIEW_DATA_REGISTER btnG2r =
+  {
+    .ID = SV_DATA_BTN_G2R, .DataType = SEGGER_SYSVIEW_TYPE_FLOAT,
+    .RangeMin = 0, .RangeMax = 6000000, .ScalingFactor = 1.0f,
+    .sName = "BTN uretim->alim", .sUnit = "us"
+  };
+  /* Cagri suresi: bos yerde birkac us, dolu txQ'da timeout'a (50 ms) kadar */
+  static SEGGER_SYSVIEW_DATA_REGISTER telSend =
+  {
+    .ID = SV_DATA_TEL_SEND, .DataType = SEGGER_SYSVIEW_TYPE_FLOAT,
+    .RangeMin = 0, .RangeMax = (I32)(TXQ_SEND_TIMEOUT_MS * 1000u), .ScalingFactor = 1.0f,
+    .sName = "TEL send cagri", .sUnit = "us"
+  };
+  static SEGGER_SYSVIEW_DATA_REGISTER btnSend =
+  {
+    .ID = SV_DATA_BTN_SEND, .DataType = SEGGER_SYSVIEW_TYPE_FLOAT,
+    .RangeMin = 0, .RangeMax = (I32)(TXQ_SEND_TIMEOUT_MS * 1000u), .ScalingFactor = 1.0f,
+    .sName = "BTN send cagri", .sUnit = "us"
+  };
+  SEGGER_SYSVIEW_RegisterData(&fill);
+  SEGGER_SYSVIEW_RegisterData(&drop);
+  SEGGER_SYSVIEW_RegisterData(&telG2r);
+  SEGGER_SYSVIEW_RegisterData(&btnG2r);
+  SEGGER_SYSVIEW_RegisterData(&telSend);
+  SEGGER_SYSVIEW_RegisterData(&btnSend);
+  SEGGER_SYSVIEW_NameMarker(SV_MARK_TXQ_FULL,  "txQ DOLU");
+  SEGGER_SYSVIEW_NameMarker(SV_MARK_TXQ_RESET, "BUTON: txQ sifirlandi");
+  SEGGER_SYSVIEW_NameMarker(SV_MARK_SEND_WAIT, "TEL send bekliyor (txQ dolu)");
+  SEGGER_SYSVIEW_NameMarker(SV_MARK_RECV_WAIT, "UartTx receive bekliyor (txQ bos)");
+}
+
+static void sv_sample(U32 id, uint32_t value)
+{
+  float v = (float)value;
+  SEGGER_SYSVIEW_DATA_SAMPLE s = { .ID = id, .pValue.pFloat = &v };
+  SEGGER_SYSVIEW_SampleData(&s);
+}
+
+/* Terminal'e "txQ [#######.............]  7/20 <ek>" satiri. snprintf yok:
+ * TelemetriTask'in kucuk yiginda da guvenle cagrilir. */
+static void sv_print_fill(uint32_t fill, const char *tail)
+{
+  char  s[64];
+  char *p = s;
+  for (const char *h = "txQ ["; *h; h++) *p++ = *h;
+  for (uint32_t i = 0; i < TXQ_LEN; i++) *p++ = (i < fill) ? '#' : '.';
+  *p++ = ']';
+  *p++ = ' ';
+  *p++ = (fill >= 10u) ? (char)('0' + fill / 10u) : ' ';
+  *p++ = (char)('0' + fill % 10u);
+  *p++ = '/';
+  *p++ = (char)('0' + TXQ_LEN / 10u);
+  *p++ = (char)('0' + TXQ_LEN % 10u);
+  while ((*tail != '\0') && (p < &s[sizeof(s) - 1u])) *p++ = *tail++;
+  *p = '\0';
+  SEGGER_SYSVIEW_Print(s);
+}
+#define SV_SAMPLE(id, v)       sv_sample((id), (v))
+#define SV_PRINT_FILL(f, t)    sv_print_fill((f), (t))
+#define SV_MARK_START(id)      SEGGER_SYSVIEW_MarkStart(id)
+#define SV_MARK_STOP(id)       SEGGER_SYSVIEW_MarkStop(id)
+#define SV_MARK(id)            SEGGER_SYSVIEW_Mark(id)
+#define SV_WARN(s)             SEGGER_SYSVIEW_Warn(s)
+#define SV_PRINTF(...)         SEGGER_SYSVIEW_PrintfTarget(__VA_ARGS__)
+#define SV_WARNF(...)          SEGGER_SYSVIEW_WarnfTarget(__VA_ARGS__)
+#else
+#define SV_SAMPLE(id, v)       ((void)0)
+#define SV_PRINT_FILL(f, t)    ((void)0)
+#define SV_MARK_START(id)      ((void)0)
+#define SV_MARK_STOP(id)       ((void)0)
+#define SV_MARK(id)            ((void)0)
+#define SV_WARN(s)             ((void)0)
+#define SV_PRINTF(...)         ((void)0)
+#define SV_WARNF(...)          ((void)0)
+#endif
+
+/* --------------------- txQ kaynak istatistigi (g_rt.txq[src]) --------------------- */
+/* Gonderim: ureticinin baglaminda (TelemetriTask / ButtonTask / USART2 RX ISR) */
+static void txq_stat_send(TxSource src, BaseType_t ok, uint32_t call_us)
+{
+  volatile TxqSrcStats *s = &g_rt.txq[src];
+  s->attempted++;
+  if (ok == pdPASS) s->accepted++;
+  else              s->failed++;
+  s->send_call_us = call_us;
+  if (call_us > s->send_call_us_max)
+  {
+    s->send_call_us_max = call_us;
+  }
+}
+
+/* Alim: UartTxTask, xQueueReceive dondukten hemen sonra */
+static void txq_stat_receive(const TxMsg *m, uint32_t t_recv_us)
+{
+  volatile TxqSrcStats *s = &g_rt.txq[m->src];
+  const uint32_t g2r = t_recv_us - m->t_gen_us;
+  s->generation_to_receive_us = g2r;
+  if (g2r > s->generation_to_receive_us_max)
+  {
+    s->generation_to_receive_us_max = g2r;
+  }
+  if (m->src == TEL)      SV_SAMPLE(SV_DATA_TEL_G2R, g2r);
+  else if (m->src == BTN) SV_SAMPLE(SV_DATA_BTN_G2R, g2r);
+}
+
+/* Servis bitti: UartTxTask, mesaj UART'tan gonderildikten / komut uygulandiktan sonra */
+static void txq_stat_consumed(TxSource src)
+{
+  g_rt.txq[src].consumed++;
+}
+
+/* Doluluk: Data Plot'a her degisimde ornek; Terminal'e yalnizca dolarken her yeni
+ * seviye (dolu iken 19<->20 salinimi Terminal'i doldurmasin). */
+static uint32_t txqShown;                   /* Terminal'e yazilan en yuksek seviye */
+
+static void txq_trace_fill(void)
+{
+  const uint32_t fill = (uint32_t)uxQueueMessagesWaiting(txQ);
+  int print = 0;
+
+  SV_SAMPLE(SV_DATA_TXQ_FILL, fill);
+
+  taskENTER_CRITICAL();                     /* 3 task da cagirir */
+  if (fill == 0u)
+  {
+    txqShown = 0u;
+  }
+  else if (fill > txqShown)
+  {
+    txqShown = fill;
+    print    = 1;
+  }
+  taskEXIT_CRITICAL();
+
+  if (print)
+  {
+    SV_PRINT_FILL(fill, (fill == TXQ_LEN) ? "  DOLU" : "");
+  }
+  (void)print;
+}
+
+/* TelemetriTask: yazma dolu kuyruga takildi. Ilk takilmada "txQ DOLU" araligini acar. */
+static void txq_on_full(void)
+{
+  g_rt.txq_full++;
+  SV_SAMPLE(SV_DATA_TXQ_DROP, g_rt.txq_full);
+  if (!txqFullLatched)
+  {
+    txqFullLatched = 1u;
+    SV_MARK_START(SV_MARK_TXQ_FULL);
+    SV_WARN("txQ DOLU - bosaltmak icin butona bas");
+  }
+}
+
+/* ButtonTask: txQ dolu durumdaysa (latch) kuyrugu TEK SEFERDE bosaltir ve bellegini
+ * sifirlar; silinen mesaj sayisini dondurur. Okuyucu yavas kalir: kuyruk yeniden dolar.
+ * Silinen BTN yanitlari DROPQ isaretlenir (REC raporu takilmasin), CTL komutlari kaybolmaz. */
+static uint32_t txq_reset_if_full(void)
+{
+  uint8_t full;
+  taskENTER_CRITICAL();
+  full           = txqFullLatched;
+  txqFullLatched = 0u;
+  taskEXIT_CRITICAL();
+  if (!full)
+  {
+    return 0u;
+  }
+
+  TxMsg    m;
+  uint32_t n = 0u;
+  while (xQueueReceive(txQ, &m, 0) == pdPASS)   /* bekleme yok: bir anda hepsi */
+  {
+    n++;
+    g_rt.txq[m.src].flushed++;
+    if (m.src == BTN)
+    {
+      mark_drop(m.id);
+    }
+    else if (m.src == CTL)
+    {
+      taskENTER_CRITICAL();
+      ctlPendingCmd  = m.u.ctl.cmd;
+      ctlPendingBaud = m.u.ctl.baud;
+      ctlPending     = 1u;
+      taskEXIT_CRITICAL();
+    }
+  }
+  /* Kuyruk bos: eski verileri depodan da sil (debugger'da txQStorage = 0).
+   * TelemetriTask (yuksek oncelik) araya girip yazmasin diye kritik bolgede. */
+  taskENTER_CRITICAL();
+  if (uxQueueMessagesWaiting(txQ) == 0u)
+  {
+    memset(txQStorage, 0, sizeof(txQStorage));
+  }
+  txqShown = 0u;                            /* dolum Terminal'de bastan izlensin */
+  taskEXIT_CRITICAL();
+
+  g_rt.txq_reset++;
+  g_rt.txq_reset_msgs += n;
+  SV_MARK_STOP(SV_MARK_TXQ_FULL);           /* "txQ DOLU" araligi kapanir */
+  SV_MARK(SV_MARK_TXQ_RESET);               /* Timeline'da tek bayrak     */
+  SV_WARNF("BUTON: txQ sifirlandi, %u mesaj silindi - kuyruk yeniden doluyor", (unsigned)n);
+  SV_PRINT_FILL(0u, "  <- BUTON ile sifirlandi");
+  txq_trace_fill();
+  return n;
+}
+
+/* Gonderim timeout'u: TXQ_SEND_TIMEOUT_MS, ama periyodun yarisini asmaz
+ * (S2..S5'te de TelemetriTask bir sonraki periyodunu kacirmasin). */
+static TickType_t txq_send_timeout(uint8_t scn)
+{
+  const uint32_t half = kScenario[scn].period_ms / 2u;
+  const uint32_t ms   = ((half != 0u) && (half < TXQ_SEND_TIMEOUT_MS)) ? half : TXQ_SEND_TIMEOUT_MS;
+  return pdMS_TO_TICKS(ms);
+}
+
+/* Timeout'lu xQueueSend. txQ doluysa gorevin bekledigi aralik SystemView'da
+ * "TEL send bekliyor" marker'i ile gorunur; sonuc Terminal'e yazilir:
+ *  - sure icinde yer acildi -> yazildi
+ *  - TIMEOUT -> veri hicbir yere yazilmadan ATILIR (errQUEUE_FULL) */
+static BaseType_t txq_send(const TxMsg *m, TickType_t timeout, const char *who)
+{
+  const int full = (uxQueueSpacesAvailable(txQ) == 0u);
+  uint32_t  t    = 0u;
+  if (full)
+  {
+    SV_MARK_START(SV_MARK_SEND_WAIT);
+    SV_PRINTF("%s #%u: txQ DOLU -> xQueueSend %u ms bekliyor", who, (unsigned)m->id,
+              (unsigned)(timeout * portTICK_PERIOD_MS));
+    t = timer_us();
+  }
+
+  const uint32_t   tCall  = timer_us();
+  const BaseType_t ok     = xQueueSend(txQ, m, timeout);
+  const uint32_t   callUs = timer_us() - tCall;   /* duvar saati: bloklanma + kesilme dahil */
+  txq_stat_send(m->src, ok, callUs);
+  if (m->src == TEL)      SV_SAMPLE(SV_DATA_TEL_SEND, callUs);
+  else if (m->src == BTN) SV_SAMPLE(SV_DATA_BTN_SEND, callUs);
+
+  if (full)
+  {
+    const unsigned waited = (unsigned)((timer_us() - t) / 1000u);
+    SV_MARK_STOP(SV_MARK_SEND_WAIT);
+    if (ok == pdPASS)
+    {
+      SV_PRINTF("%s #%u: %u ms sonra yer acildi -> txQ'ya yazildi", who, (unsigned)m->id, waited);
+    }
+    else
+    {
+      SV_WARNF("%s #%u: SEND TIMEOUT (%u ms) -> veri ATILDI", who, (unsigned)m->id, waited);
+    }
+    (void)waited;
+  }
+  (void)who;
+  return ok;
+}
+
+/* Timeout'lu xQueueReceive (UartTxTask). txQ bossa bekleme "UartTx receive bekliyor"
+ * marker'i ile gorunur. Telemetri kapaliyken (S0) bos kuyruk normaldir: isaretlenmez. */
+static BaseType_t txq_receive(TxMsg *m)
+{
+  const int show = (kScenario[g_scn].period_ms != 0u) && (uxQueueMessagesWaiting(txQ) == 0u);
+  uint32_t  t    = 0u;
+  if (show)
+  {
+    SV_MARK_START(SV_MARK_RECV_WAIT);
+    SV_PRINTF("UartTx: txQ BOS -> xQueueReceive %u ms bekliyor", (unsigned)TXQ_RECV_TIMEOUT_MS);
+    t = timer_us();
+  }
+
+  const BaseType_t ok = xQueueReceive(txQ, m, pdMS_TO_TICKS(TXQ_RECV_TIMEOUT_MS));
+  if (ok == pdPASS)
+  {
+    txq_stat_receive(m, timer_us());
+  }
+
+  if (show)
+  {
+    const unsigned waited = (unsigned)((timer_us() - t) / 1000u);
+    SV_MARK_STOP(SV_MARK_RECV_WAIT);
+    if (ok == pdPASS)
+    {
+      SV_PRINTF("UartTx: %u ms sonra veri geldi -> okundu", waited);
+    }
+    else
+    {
+      SV_WARNF("UartTx: RECEIVE TIMEOUT (%u ms) -> txQ bos kaldi", waited);
+    }
+    (void)waited;
+  }
+  return ok;
+}
+
+/* Yavas okuma: bir sonraki TEL okumasina kadar bekleme (tick) */
+static TickType_t txq_read_gap(uint8_t scn)
+{
+  const uint32_t period = kScenario[scn].period_ms;
+  if (period == 0u)
+  {
+    return 0u;
+  }
+  return pdMS_TO_TICKS(period * TXQ_WRITES_PER_READ);
 }
 /* USER CODE END 0 */
 
@@ -1040,7 +1418,16 @@ void uart_rx_irq(void)
   m.u.ctl.cmd  = cmd;
   m.u.ctl.baud = baud;
   BaseType_t wake = pdFALSE;
-  (void)xQueueSendToFrontFromISR(txQ, &m, &wake);
+  m.t_gen_us = timer_us();
+  const BaseType_t ok = xQueueSendToFrontFromISR(txQ, &m, &wake);
+  txq_stat_send(CTL, ok, timer_us() - m.t_gen_us);
+  if (ok != pdPASS)
+  {
+    /* txQ dolu (yavas okuyucu): komutu kaybetme, UartTxTask sonraki turda alir */
+    ctlPendingCmd  = cmd;
+    ctlPendingBaud = baud;
+    ctlPending     = 1u;
+  }
   portYIELD_FROM_ISR(wake);
 }
 
@@ -1114,13 +1501,23 @@ static void TelemetriTask(void *argument)
 
     calibrated_work(work_iters(cfg->work_ms));
     TxMsg m = make_telemetry(tRelease);
-    if (xQueueSend(txQ, &m, 0) != pdPASS)
-      count_tx_drop(TEL);
+    if (txq_send(&m, txq_send_timeout(scn), "TEL") != pdPASS)
+    {
+      count_tx_drop(TEL);                   /* timeout: veri atildi, baska yere yazilmaz */
+      txq_on_full();
+    }
+    txq_trace_fill();
+    const uint32_t fill = (uint32_t)uxQueueMessagesWaiting(txQ);
+    if (fill > g_rt.txq_max_fill)
+    {
+      g_rt.txq_max_fill = fill;
+    }
     xTaskDelayUntil(&last, pdMS_TO_TICKS(cfg->period_ms));
   }
 }
 
-/* Orta oncelik: ISR olayini alir, cevabi txQ'ya birakir. UART kullanmaz. */
+/* Orta oncelik: ISR olayini alir, cevabi txQ'ya birakir. UART kullanmaz.
+ * txQ dolu durumdayken gelen basis kuyrugu bir anda bosaltir ve sifirlar. */
 static void ButtonTask(void *argument)
 {
   (void)argument;
@@ -1130,19 +1527,26 @@ static void ButtonTask(void *argument)
   {
     xQueueReceive(buttonQ, &e, portMAX_DELAY);
     begin_record(e, timer_us());              /* t1 */
+    (void)txq_reset_if_full();                /* txQ dolduysa bir anda bosalt + sifirla */
     TxMsg m = make_button_reply(e.id);
     record_t2(e.id, timer_us());              /* t2 */
-    if (xQueueSend(txQ, &m, 0) != pdPASS)
+    if (txq_send(&m, pdMS_TO_TICKS(TXQ_SEND_TIMEOUT_MS), "BTN") != pdPASS)
       mark_drop(e.id);
   }
 }
 
-/* En dusuk oncelik: txQ'yu FIFO sirasiyla tuketir, UART'in tek sahibi. */
+/* En dusuk oncelik: txQ'yu FIFO sirasiyla tuketir, UART'in tek sahibi.
+ * Okuyucu bilerek yavas: her TEL mesajindan sonra TXQ_WRITES_PER_READ uretim
+ * periyodu bekler. TelemetriTask 3 yazarken burada 1 okunur, txQ (20) dolar ve
+ * sonrasinda TelemetriTask'in fazla yazmalari tel_drop / txq_full olarak sayilir.
+ * Butonla sifirlanan kuyruk bu yavas okuma surdugu icin kendiliginden yeniden dolar. */
 static void UartTxTask(void *argument)
 {
   (void)argument;
   TxMsg m;
   int   len;
+  uint8_t  cmd;
+  uint32_t baud;
 
   len = snprintf(txBuf, sizeof(txBuf), "# Hafta-01 olcum: TIM2=1MHz DL=%luus filtre=%luus\n",
                  (unsigned long)BTN_DEADLINE_US, (unsigned long)BTN_REFILTER_US);
@@ -1154,14 +1558,34 @@ static void UartTxTask(void *argument)
   (void)uart_send(len);
   send_scn_line();
 
+  len = snprintf(txBuf, sizeof(txBuf), "# TXQ len=%lu yazma:okuma=%lu:1 send_to=%lums recv_to=%lums\n",
+                 (unsigned long)TXQ_LEN, (unsigned long)TXQ_WRITES_PER_READ,
+                 (unsigned long)TXQ_SEND_TIMEOUT_MS, (unsigned long)TXQ_RECV_TIMEOUT_MS);
+  (void)uart_send(len);
+
   for (;;)
   {
-    if (xQueueReceive(txQ, &m, pdMS_TO_TICKS(UARTTX_IDLE_MS)) == pdPASS)
+    /* txQ doluyken gelen komut (bkz. uart_rx_irq) */
+    taskENTER_CRITICAL();
+    const uint8_t pend = ctlPending;
+    cmd        = ctlPendingCmd;
+    baud       = ctlPendingBaud;
+    ctlPending = 0u;
+    taskEXIT_CRITICAL();
+    if (pend)
     {
+      apply_ctl(cmd, baud);
+    }
+
+    if (txq_receive(&m) == pdPASS)            /* timeout: txQ bos kaldi, rapora gec */
+    {
+      const TickType_t tRead = xTaskGetTickCount();
+      txq_trace_fill();                       /* okuma sonrasi doluluk */
       switch (m.src)
       {
         case BTN:
           handle_button_reply(&m);
+          txq_stat_consumed(BTN);
           break;
 
         case TEL:
@@ -1173,10 +1597,21 @@ static void UartTxTask(void *argument)
           {
             g_rt.tel_sent++;
           }
+          txq_stat_consumed(TEL);             /* servis bitti; asagidaki bekleme dahil degil */
+          /* Yavas okuyucu: bir sonraki okuma ancak 3 uretim periyodu sonra */
+          {
+            TickType_t last = tRead;
+            const TickType_t gap = txq_read_gap(m.scn);
+            if (gap != 0u)
+            {
+              xTaskDelayUntil(&last, gap);
+            }
+          }
           break;
 
         case CTL:
-          apply_ctl(m.u.ctl.cmd, m.u.ctl.baud);
+          apply_ctl(m.u.ctl.cmd, m.u.ctl.baud);   /* senaryo komutu g_rt'yi sifirlar */
+          txq_stat_consumed(CTL);
           break;
 
         default:
